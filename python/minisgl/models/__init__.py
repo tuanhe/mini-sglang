@@ -11,6 +11,10 @@ def create_model(model_path: str, model_config: ModelConfig) -> BaseLLMModel:
         from .llama import LlamaForCausalLM
 
         return LlamaForCausalLM(model_config)
+    elif "qwen3-vl" in model_name:
+        from .qwen3vl import Qwen3VLForCausalLM
+
+        return Qwen3VLForCausalLM(model_config)
     elif "qwen3" in model_name:
         from .qwen3 import Qwen3ForCausalLM
 

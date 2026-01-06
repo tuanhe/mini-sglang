@@ -36,6 +36,7 @@ def _align_up_32(num: int) -> int:
 class Engine:
     def __init__(self, config: EngineConfig):
         self.model_config = config.model_config
+
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
 
         assert not torch.cuda.is_initialized()

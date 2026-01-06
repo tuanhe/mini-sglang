@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from transformers.activations import ACT2FN
 
 from minisgl.layers import (
     AttentionLayer,
@@ -9,6 +10,7 @@ from minisgl.layers import (
     LinearOProj,
     LinearQKVMerged,
     LinearRowParallel,
+    LinearColumnParallel,
     RMSNorm,
     silu_and_mul,
 )
@@ -95,4 +97,60 @@ class RopeAttn(BaseOP):
         return self.o_proj.forward(o)
 
 
-__all__ = ["GatedMLP", "RopeAttn"]
+class VisionMLP(BaseOP):
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        bias: bool = True,
+        hidden_act="silu",
+    ):
+        super().__init__()
+        self.linear_fc1 = LinearColumnParallel(
+            in_features,
+            hidden_features,
+            bias=bias,
+        )
+        self.linear_fc2 = LinearRowParallel(
+            hidden_features,
+            in_features,
+            bias=bias,
+        )
+        self.act = ACT2FN[hidden_act]
+
+    def forward(self, x: torch.Tensor):
+        x_fc1, _ = self.linear_fc1(x)
+        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        return mlp_output
+
+
+
+class VisionAtten(BaseOP):
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        projection_size: int,
+    ):
+        self.qkv_proj = QKVParallelLinear(
+                hidden_size=embed_dim,
+                head_size=self.head_size,
+                total_num_heads=num_dummy_heads + num_heads,
+                total_num_kv_heads=num_dummy_heads + num_heads,
+                bias=True)
+        
+        self.proj = LinearRowParallel(
+            input_size=self.dummy_dim,
+            output_size=embed_dim,
+            bias=True,
+        )
+        
+    
+    def forward(self, x: torch.Tensor):
+        return None
+    
+    
+
+__all__ = ["GatedMLP", "RopeAttn", "VisionMLP"]
