@@ -6,20 +6,19 @@ import torch
 import torch.nn as nn
 from minisgl.core import get_global_ctx
 from minisgl.layers import ( BaseOP, OPList, ParallelLMHead, RMSNormFused, 
-                    VocabParallelEmbedding, LinearColParallelMerged, LinearRowParallel)
+                    VocabParallelEmbedding, LinearColParallelMerged, LinearRowParallel,
+                    QKVParallelLinear)
+
 from minisgl.utils import nvtx_annotate
 
 from .base import BaseLLMModel
 from .utils import GatedMLP as Qwen3MLP
 from .utils import RopeAttn as Qwen3Attn
 from .utils import VisionMLP as Qwen3_VisionMLP
+from .utils import VisionAtten as Qwen3_VisionAtten
 
 if TYPE_CHECKING:
     from .config import ModelConfig, VisionConfig
-
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from einops import rearrange
 
@@ -111,21 +110,18 @@ class Qwen3_VisionBlock(nn.Module):
         num_heads: int,
         intermediate_dim: int,
         hidden_act="silu",
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
     ) -> None:
         super().__init__()
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm1 = norm_layer(dim)
-        self.norm2 = norm_layer(dim)
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
 
-        self.attn = VisionAttention(
+        self.attn = Qwen3_VisionAtten(
             embed_dim=dim,
             num_heads=num_heads,
-            projection_size=dim,
-            use_qkv_parallel=True,
-            proj_bias=True,
-            flatten_batch=True,
+            # projection_size=dim,
+            # use_qkv_parallel=True,
+            # proj_bias=True,
+            # flatten_batch=True,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -160,7 +156,6 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
-        norm_layer: Optional[Callable[[int], nn.Module]] = None,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
     ) -> None:
@@ -169,9 +164,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
 
         self.use_postshuffle_norm = use_postshuffle_norm
 
-        if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.norm = norm_layer(
+        self.norm = nn.LayerNorm(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
         self.linear_fc1 = LinearColParallelMerged(
@@ -197,6 +190,18 @@ class Qwen3VLVisionPatchMerger(nn.Module):
         out, _ = self.linear_fc2(x_parallel)
         return out
 
+class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, seqlen: int) -> torch.Tensor:
+        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(seq, self.inv_freq)
+        return freqs
 
 
 class Qwen3VLVisionModel(nn.Module):
@@ -227,18 +232,13 @@ class Qwen3VLVisionModel(nn.Module):
                 self.num_position_embeddings,
                 self.hidden_size,
             )
+        ## transformer
+        ## self.pos_embed = nn.Embedding(config.num_position_embeddings, config.hidden_size)
 
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
-        # self.rotary_pos_emb = get_rope(
-            # head_size=head_dim,
-            # rotary_dim=head_dim // 2,
-            # max_position=8192,
-            # base=10000.0,
-            # is_neox_style=True,
-        # )
         
-        self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
         
         self.blocks = nn.ModuleList(
             [
@@ -247,7 +247,6 @@ class Qwen3VLVisionModel(nn.Module):
                     num_heads=self.num_heads,
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
-                    norm_layer=norm_layer,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -256,7 +255,6 @@ class Qwen3VLVisionModel(nn.Module):
         self.merger = Qwen3VLVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
-            norm_layer=norm_layer,
             spatial_merge_size=self.spatial_merge_size,
         )
 
@@ -267,11 +265,95 @@ class Qwen3VLVisionModel(nn.Module):
                     context_dim=self.hidden_size,
                     spatial_merge_size=self.spatial_merge_size,
                     use_postshuffle_norm=True,
-                    norm_layer=norm_layer,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
         )
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        num_grid_per_side = int(self.num_position_embeddings**0.5)
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        # TODO: use torch instand of np
+        for t, h, w in grid_thw:
+            h_idxs = np.linspace(0, num_grid_per_side - 1, h)
+            w_idxs = np.linspace(0, num_grid_per_side - 1, w)
+
+            h_idxs_floor = h_idxs.astype(int)
+            w_idxs_floor = w_idxs.astype(int)
+            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            idx_list[0].extend(
+                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[1].extend(
+                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[2].extend(
+                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_floor[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+            idx_list[3].extend(
+                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_ceil[None])
+                .flatten()
+                .tolist()
+                * t
+            )
+
+            weight_list[0].extend(
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten().tolist() * t
+            )
+            weight_list[1].extend(((1 - dh)[None].T * dw[None]).flatten().tolist() * t)
+            weight_list[2].extend((dh[None].T * (1 - dw)[None]).flatten().tolist() * t)
+            weight_list[3].extend((dh[None].T * dw[None]).flatten().tolist() * t)
+
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+
+        p0 = (
+            self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
+        )
+        p1 = (
+            self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
+        )
+        p2 = (
+            self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
+        )
+        p3 = (
+            self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device))
+            * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
+        )
+
+        patch_pos_embeds = p0 + p1 + p2 + p3
+        patch_pos_embeds = patch_pos_embeds.split([t * h * w for t, h, w in grid_thw])
+        patch_pos_embeds_permute = []
+        m_size = self.spatial_merge_size
+        for pos_embed, (t, h, w) in zip(patch_pos_embeds, grid_thw):
+            pos_embed = (
+                pos_embed.view(t, h // m_size, m_size, w // m_size, m_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            patch_pos_embeds_permute.append(pos_embed)
+        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
+        return patch_pos_embeds
 
     def forward(
         self,
@@ -280,38 +362,36 @@ class Qwen3VLVisionModel(nn.Module):
     ) -> torch.Tensor:
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        
-        if isinstance(grid_thw, list):
-            grid_thw_list = grid_thw
-            grid_thw = torch.tensor(grid_thw, dtype=torch.int32)
-        else:
-            grid_thw_list = grid_thw.tolist()
 
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         x += pos_embeds
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+        seq_len, _ = x.size()
+        rotary_pos_emb = rotary_pos_emb.to(x.device)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
 
         # compute cu_seqlens
-        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if not is_npu():
-            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-        else:
-            cu_seqlens = cu_seqlens.to("cpu")
+        # cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+            dim=0,
+            # Select dtype based on the following factors:
+            #  - FA2 requires that cu_seqlens_q must have dtype int32
+            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
+            # See https://github.com/huggingface/transformers/pull/34852 for more information
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
         x = x.unsqueeze(1)
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
-
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(
-                x,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-            )
-
+            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
                     x

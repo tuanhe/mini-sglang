@@ -10,6 +10,10 @@ from minisgl.utils import divide_even
 from .base import BaseOP
 
 
+def divide(total: int, num_partitions: int) -> int:
+    """均分整数（确保无余数，TP场景下通常要求可分）"""
+    assert total % num_partitions == 0, f"{total} 无法被 {num_partitions} 均分"
+    return total // num_partitions
 class _LinearTPImpl(BaseOP):
     """Real implementation of a linear layer with tensor parallelism."""
 
@@ -147,13 +151,8 @@ class LinearColumnParallel(_LinearTPImpl):
 
         return y
     
-class QKVParallelLinear(LinearColumnParallel):
-    """张量并行下的QKV合并投影层（继承列并行线性层）
-    
-    功能：将输入x通过一个合并的线性层投影为Q、K、V，同时支持张量并行（按输出维度拆分权重）
-    输入：x [B, N, hidden_size]
-    输出：qkv [B, N, 3×hidden_size]（若gather_output=True）或拆分后的局部QKV [B, N, 3×local_hidden_size]
-    """
+
+class QKVParallelLinear(LinearColumnParallel):  # 继承你的列并行基类
     def __init__(
         self,
         hidden_size: int,
@@ -163,53 +162,64 @@ class QKVParallelLinear(LinearColumnParallel):
         bias: bool = True,
     ):
         tp_info = get_tp_info()
-        tp_size = tp_info.size
-        self.head_size = head_size
+        self.tp_size = tp_info.size
+        
+        # 1. 初始化TP基础信息
+        self.tp_rank = tp_info.rank
+        
+        # 2. 计算当前TP进程的Q/KV头数（核心拆分逻辑）
         self.total_num_heads = total_num_heads
-        self.total_num_kv_heads = total_num_kv_heads
-        self.num_heads = self.total_num_heads // tp_size
-        # QKV合并后的总输出维度 = 3 × hidden_size（Q、K、V各占hidden_size）
-        full_qkv_output_size = 3 * hidden_size
+        self.total_num_kv_heads = total_num_kv_heads or total_num_heads
+        self.head_size = head_size
         
-        if tp_size >= self.total_num_kv_heads:
+        # Q头：按TP进程均分
+        self.num_heads = divide(self.total_num_heads, self.tp_size)
+        # KV头：若TP进程数≥总KV头数，则每个进程复制1个KV头；否则均分KV头
+        if self.tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = tp_size // self.total_num_kv_heads
         else:
-            self.num_kv_heads = self.total_num_kv_heads // tp_size
-            
-        input_size = self.hidden_size
-        output_size = ( (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, self.tp_size)
         
-        # 调用父类LinearColumnParallel的初始化：
-        # - 输入维度：hidden_size（与QKV输入一致）
-        # - 输出维度：full_qkv_output_size（合并后的总输出维度）
-        # 父类会自动将输出维度按TP大小拆分，得到local_output_size = (3×hidden_size) / tp_size
+        # 3. 计算当前进程的QKV输出维度（本地分片大小）
+        self.q_shard_dim = self.num_heads * self.head_size       # 本地Q输出维度
+        self.k_shard_dim = self.num_kv_heads * self.head_size    # 本地K输出维度
+        self.v_shard_dim = self.num_kv_heads * self.head_size    # 本地V输出维度
+        
+        # 4. 父类（列并行）的总输出维度 = 本地QKV维度之和 × TP进程数？不！
+        # 父类的output_size应为【本地QKV总维度】（因为列并行的输出维度是本地分片）
+        # 注：原代码的output_size计算有误，正确逻辑是“本地输出维度=Q+K+V的本地分片之和”
+        input_size = hidden_size
+        local_output_size = self.q_shard_dim + self.k_shard_dim + self.v_shard_dim
+        
+        # 5. 初始化列并行基类（核心：输入不拆分，输出为本地QKV总维度）
         super().__init__(
             input_size=input_size,
-            output_size=output_size,
+            output_size=local_output_size,  # 父类需要的“全局输出维度”实际应为本地？不！
+            # 修正：父类的output_size是【全局输出维度】，本地输出维度=output_size//tp_size
+            # 因此正确的全局输出维度 = （Q总维度 + K总维度 + V总维度）
+            # Q总维度 = total_num_heads × head_size
+            # K/V总维度 = total_num_kv_heads × head_size
+            output_size=(self.total_num_heads + 2*self.total_num_kv_heads)*self.head_size,
             has_bias=bias,
-            gather_output=False
+            gather_output=False,  # QKV不需要聚合（后续自行拆分）
         )
         
-        # 记录QKV相关维度（用于后续拆分Q/K/V）
-        self.hidden_size = hidden_size
-        self.full_qkv_output_size = full_qkv_output_size
+        # 6. 额外参数（与原逻辑对齐）
+        self.bias = bias
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播：合并投影→（可选聚合）→拆分Q/K/V
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """前向传播：输出拆分后的Q/K/V（本地分片）"""
+        # 1. 调用父类列并行计算：输入x → 本地QKV拼接的输出（shape: [B, ..., Q+K+V本地维度]）
+        y, bias = super().forward(x)  # 假设父类forward返回(输出, 偏置)；若父类无bias返回则调整
         
-        Args:
-            x: 输入特征 [B, N, hidden_size]（B: batch, N: token数）
-        Returns:
-            qkv: 合并的QKV投影结果 [B, N, 3×hidden_size]（若gather_output=True）
-                 或 [B, N, 3×local_hidden_size]（若gather_output=False）
-        """
-        # Step 1: 调用父类LinearColumnParallel的forward，完成列并行线性变换+（可选）聚合
-        qkv_merged = super().forward(x)  # 形状：[B, N, full_qkv_output_size]或[B, N, local_qkv_output_size]
+        # 2. 拆分本地输出为Q/K/V分片
+        q_shard = y[..., :self.q_shard_dim]               # [B, ..., num_heads×head_size]
+        k_shard = y[..., self.q_shard_dim:self.q_shard_dim+self.k_shard_dim]  # [B, ..., num_kv_heads×head_size]
+        v_shard = y[..., self.q_shard_dim+self.k_shard_dim:]  # [B, ..., num_kv_heads×head_size]
         
-        # Step 2: 将合并的QKV拆分为独立的Q、K、V（按最后一维拆分）
-        # 拆分后Q/K/V的维度：每个为 [B, N, hidden_size]（若聚合）或 [B, N, local_hidden_size]（若未聚合）
-        q, k, v = qkv_merged.split(self.hidden_size, dim=-1)
-        
-        return q, k, v
-
+        # 3. 若需要跳过偏置加法，返回偏置；否则直接加偏置（与原逻辑对齐）
+        if self.bias:
+            q_shard += bias[..., :self.q_shard_dim]
+            k_shard += bias[..., self.q_shard_dim:self.q_shard_dim+self.k_shard_dim]
+            v_shard += bias[..., self.q_shard_dim+self.k_shard_dim:]
+        return q_shard, k_shard, v_shard
