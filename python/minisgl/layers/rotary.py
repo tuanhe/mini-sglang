@@ -122,6 +122,35 @@ def set_rope_device(device: torch.device):
     _ROPE_DEVICE = device
 
 
+def _make_hashable(obj: Any) -> Any:
+    """Recursively convert lists/dicts to tuples for hashing."""
+    if isinstance(obj, list):
+        return tuple(_make_hashable(x) for x in obj)
+    if isinstance(obj, dict):
+        return tuple(sorted((k, _make_hashable(v)) for k, v in obj.items()))
+    return obj
+
+
+def _make_rope_scaling_hashable(scaling: dict | None) -> Tuple[Tuple[str, Any], ...] | None:
+    if scaling is None:
+        return None
+    return tuple((k, _make_hashable(v)) for k, v in scaling.items())
+
+
+def _unhash_rope_scaling(scaling_tuple: Tuple[Tuple[str, Any], ...] | None) -> dict | None:
+    if scaling_tuple is None:
+        return None
+    result = {}
+    for k, v in scaling_tuple:
+        if isinstance(v, tuple) and v and isinstance(v[0], tuple):
+            result[k] = dict(v)
+        elif isinstance(v, tuple):
+            result[k] = list(v)
+        else:
+            result[k] = v
+    return result
+
+
 @functools.cache
 def get_rope(
     head_dim: int,
@@ -130,7 +159,7 @@ def get_rope(
     base: float,
     rope_scaling: Tuple[Tuple[str, Any], ...] | None = None,
 ) -> RotaryEmbedding:
-    rope_map = dict(rope_scaling) if rope_scaling is not None else None
+    rope_map = _unhash_rope_scaling(rope_scaling)
     t = torch.tensor([])
     if t.device == torch.device("meta"):
         # we cannot use meta device for rope

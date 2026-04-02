@@ -162,6 +162,9 @@ class Scheduler(SchedulerIOMixin):
                     new_finished_reqs.add(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
+                    # Free image data after prefill (vision encoder already ran)
+                    req.pixel_values = None
+                    req.image_grid_thw = None
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
@@ -209,6 +212,8 @@ class Scheduler(SchedulerIOMixin):
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
         self.engine.attn_backend.prepare_metadata(batch)
+        # Gather VL data for prefill batches
+        _prepare_vl_batch(batch, self.device)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -247,6 +252,58 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
         )
         offset += length
     return indices_host.to(device, non_blocking=True)
+
+
+def _prepare_vl_batch(batch: Batch, device: torch.device) -> None:
+    """Gather VL data (pixel_values, image_grid_thw, mrope_position_ids) from reqs into batch."""
+    if not batch.is_prefill:
+        batch.pixel_values = None
+        batch.image_grid_thw = None
+        batch.mrope_position_ids = None
+        return
+
+    # Gather pixel_values and image_grid_thw from reqs that have images
+    pixel_values_list = []
+    grid_thw_list = []
+    has_vl = False
+    for req in batch.reqs:
+        pv = getattr(req, "pixel_values", None)
+        if pv is not None:
+            has_vl = True
+            pixel_values_list.append(pv)
+            grid_thw_list.append(req.image_grid_thw)
+
+    if not has_vl:
+        batch.pixel_values = None
+        batch.image_grid_thw = None
+        batch.mrope_position_ids = None
+        return
+
+    batch.pixel_values = torch.cat(pixel_values_list, dim=0).to(device, non_blocking=True)
+    batch.image_grid_thw = torch.cat(grid_thw_list, dim=0).to(device, non_blocking=True)
+
+    # Gather M-RoPE position ids from padded_reqs (aligned with batch.positions)
+    mrope_parts = []
+    has_mrope = False
+    for req in batch.padded_reqs:
+        mrope_ids = getattr(req, "mrope_position_ids", None)
+        if mrope_ids is not None:
+            has_mrope = True
+            # Slice to the extend range: [cached_len, device_len)
+            mrope_parts.append(mrope_ids[:, req.cached_len : req.device_len])
+        else:
+            # Fallback: use standard 1D positions for all 3 dims
+            length = req.extend_len
+            delta = getattr(req, "rope_delta", 0)
+            pos_1d = torch.arange(
+                req.cached_len + delta, req.device_len + delta, dtype=torch.int32
+            )
+            mrope_parts.append(pos_1d.unsqueeze(0).expand(3, -1))
+
+    if has_mrope:
+        batch.mrope_position_ids = torch.cat(mrope_parts, dim=1).to(device, non_blocking=True)
+    else:
+        batch.mrope_position_ids = None
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:

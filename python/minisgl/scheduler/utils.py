@@ -17,6 +17,11 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    # VL-specific fields
+    pixel_values: torch.Tensor | None = None
+    image_grid_thw: torch.Tensor | None = None
+    mrope_position_ids: torch.Tensor | None = None
+    rope_delta: int = 0
 
     @property
     def input_len(self) -> int:

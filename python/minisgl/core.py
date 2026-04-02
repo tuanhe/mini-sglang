@@ -34,6 +34,11 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    # VL-specific fields
+    pixel_values: torch.Tensor | None = None  # cpu tensor for vision encoder
+    image_grid_thw: torch.Tensor | None = None  # (num_images, 3)
+    mrope_position_ids: torch.Tensor | None = None  # (3, input_len) for M-RoPE
+    rope_delta: int = 0  # position offset for decode after VL prefill
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -79,6 +84,10 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # VL-specific fields (set by scheduler for prefill with images)
+    pixel_values: torch.Tensor | None = field(init=False, default=None)
+    image_grid_thw: torch.Tensor | None = field(init=False, default=None)
+    mrope_position_ids: torch.Tensor | None = field(init=False, default=None)
 
     @property
     def is_prefill(self) -> bool:

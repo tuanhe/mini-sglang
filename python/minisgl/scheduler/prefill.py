@@ -87,6 +87,10 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            pixel_values=pending_req.pixel_values,
+            image_grid_thw=pending_req.image_grid_thw,
+            mrope_position_ids=pending_req.mrope_position_ids,
+            rope_delta=pending_req.rope_delta,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -121,7 +125,17 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        self.pending_list.append(
+            PendingReq(
+                uid=req.uid,
+                input_ids=req.input_ids,
+                sampling_params=req.sampling_params,
+                pixel_values=getattr(req, "pixel_values", None),
+                image_grid_thw=getattr(req, "image_grid_thw", None),
+                mrope_position_ids=getattr(req, "mrope_position_ids", None),
+                rope_delta=getattr(req, "rope_delta", 0),
+            )
+        )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:

@@ -34,6 +34,11 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    # VL-specific fields
+    pixel_values: torch.Tensor | None = None  # CPU tensor for vision encoder
+    image_grid_thw: torch.Tensor | None = None  # (num_images, 3)
+    mrope_position_ids: torch.Tensor | None = None  # (3, input_len) for M-RoPE
+    rope_delta: int = 0
 
 
 @dataclass
